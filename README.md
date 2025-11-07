@@ -8,6 +8,7 @@ Flask ベースの簡易サーバーで、MLX の Vision-Language Model (VLM) �
    ```bash
    pip install -r requirements.txt
    ```
+   - Hugging Face の Qwen 系 Processor は内部で PyTorch を要求するため、`torch` と `torchvision` のビルドが必要です。`pip install` で失敗する場合は [PyTorch の公式手順](https://pytorch.org/get-started/locally/) に従ってインストールしてください。
 3. Apple Silicon + macOS 上の MLX を想定しています。他プラットフォームでは `mlx` / `mlx-vlm` の代替を用意するか、コード側でモデル呼び出しを差し替えてください。
 
 ## 起動方法

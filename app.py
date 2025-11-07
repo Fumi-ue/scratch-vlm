@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime
 import re
 import json
+import importlib.util
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -22,6 +23,12 @@ import mlx.core as mx
 from mlx_vlm import load, generate
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_config
+
+if importlib.util.find_spec("torch") is None:
+    raise RuntimeError(
+        "PyTorch is required by the Hugging Face processor backend. "
+        "Install torch/torchvision (see README) and restart the server."
+    )
 
 app = Flask(__name__)
 infer_lock = threading.Lock()
