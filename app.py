@@ -33,6 +33,9 @@ RESIZE_CONFIG_PATH = Path("config/resize.yaml")
 # MODEL_PATH を切り替えれば他モデルにも対応可。
 model, processor = load(MODEL_PATH)
 config = load_config(MODEL_PATH)
+tokenizer = getattr(processor, "tokenizer", None)
+if tokenizer is None:
+    print("[WARN] tokenizer missing from processor; token counts will be approximate.")
 
 
 def build_format_instructions(response_format: Dict[str, Any]) -> str:
@@ -118,6 +121,38 @@ def parse_messages(messages: List[Dict[str, Any]]) -> Tuple[str, str, Optional[I
             else:
                 user_content += str(content or "")
     return system_prompt.strip(), user_content.strip(), image
+
+
+def count_tokens(text: Optional[str], *, add_special_tokens: bool = False) -> int:
+    """Return tokenizer-accurate token counts (model-specific when available)."""
+
+    if not text:
+        return 0
+
+    if tokenizer is None:
+        return len(re.findall(r"\S+", text))
+
+    try:
+        if hasattr(tokenizer, "encode"):
+            token_ids = tokenizer.encode(text, add_special_tokens=add_special_tokens)
+        else:
+            encoded = tokenizer(
+                text,
+                add_special_tokens=add_special_tokens,
+                return_attention_mask=False,
+                return_token_type_ids=False,
+            )
+            token_ids = encoded.get("input_ids", [])
+
+        if isinstance(token_ids, list):
+            if token_ids and isinstance(token_ids[0], list):
+                return len(token_ids[0])
+            return len(token_ids)
+        if hasattr(token_ids, "shape"):
+            return int(token_ids.shape[-1])
+        return len(token_ids)
+    except Exception:
+        return len(re.findall(r"\S+", text))
 
 def run_generation(prompt: str, image: Optional[Image.Image], max_tokens: int, temperature: float):
     """Run the heavy model call under a lock to keep MLX thread-safe."""
@@ -209,6 +244,10 @@ def chat_completion():
             return jsonify(error_payload), 400
         assert content_out is not None  # narrow type for static analyzers
 
+        prompt_tokens = count_tokens(formatted_prompt)
+        completion_tokens = count_tokens(content_out)
+        total_tokens = prompt_tokens + completion_tokens
+
         t_total1 = perf_counter()
 
         # 各区間の時間（ms）
@@ -218,7 +257,22 @@ def chat_completion():
         post_ms = total_ms - pre_ms - gen_ms             # 後処理（JSON抽出/検証等）
 
         # === ログ出力 ===
-        # print(f"[USAGE] prompt_tokens={prompt_tokens} completion_tokens={completion_tokens} total_tokens={total_tokens}")
+        request_meta = {
+            "model": model_name,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "response_format": response_format.get("type", "text"),
+        }
+        text_payload = {
+            "system_prompt": system_prompt,
+            "user_text": user_content,
+            "assistant_text": content_out,
+        }
+        print(f"[REQUEST_META] {json.dumps(request_meta, ensure_ascii=False)}")
+        print(f"[IO_TEXT] {json.dumps(text_payload, ensure_ascii=False)}")
+        print(
+            f"[TOKENS] prompt={prompt_tokens} completion={completion_tokens} total={total_tokens}"
+        )
         print(f"[LATENCY_MS] pre={pre_ms} gen={gen_ms} post={post_ms} total={total_ms}")
 
         return jsonify(
