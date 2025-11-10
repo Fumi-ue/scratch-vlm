@@ -12,6 +12,7 @@ import json
 import importlib.util
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
 
 try:
     import jsonschema
@@ -36,13 +37,52 @@ infer_lock = threading.Lock()
 MODEL_PATH = "mlx-community/Qwen3-VL-30B-A3B-Instruct-bf16"
 RESIZE_CONFIG_PATH = Path("config/resize.yaml")
 
-# モデル読み込み（起動時に1回）
-# MODEL_PATH を切り替えれば他モデルにも対応可。
-model, processor = load(MODEL_PATH)
-config = load_config(MODEL_PATH)
-tokenizer = getattr(processor, "tokenizer", None)
-if tokenizer is None:
-    print("[WARN] tokenizer missing from processor; token counts will be approximate.")
+
+@dataclass
+class ModelBundle:
+    model: Any
+    processor: Any
+    config: Dict[str, Any]
+    tokenizer: Optional[Any]
+
+
+_model_cache: Dict[str, ModelBundle] = {}
+_model_cache_lock = threading.Lock()
+
+
+def _create_model_bundle(model_path: str) -> ModelBundle:
+    mdl, proc = load(model_path)
+    cfg = load_config(model_path)
+    tok = getattr(proc, "tokenizer", None)
+    if tok is None:
+        print(
+            f"[WARN] tokenizer missing from processor for '{model_path}'; "
+            "token counts will be approximate."
+        )
+    return ModelBundle(model=mdl, processor=proc, config=cfg, tokenizer=tok)
+
+
+def get_model_bundle(requested_model: Optional[str]) -> Tuple[str, ModelBundle]:
+    """Return the cached bundle for requested_model, loading on demand."""
+
+    target = requested_model or MODEL_PATH
+    with _model_cache_lock:
+        bundle = _model_cache.get(target)
+    if bundle is not None:
+        return target, bundle
+
+    bundle = _create_model_bundle(target)
+    with _model_cache_lock:
+        existing = _model_cache.get(target)
+        if existing is not None:
+            return target, existing
+        _model_cache[target] = bundle
+    return target, bundle
+
+
+# Load the default model at startup so we are ready for requests immediately.
+with _model_cache_lock:
+    _model_cache[MODEL_PATH] = _create_model_bundle(MODEL_PATH)
 
 
 def build_format_instructions(response_format: Dict[str, Any]) -> str:
@@ -130,7 +170,12 @@ def parse_messages(messages: List[Dict[str, Any]]) -> Tuple[str, str, Optional[I
     return system_prompt.strip(), user_content.strip(), image
 
 
-def count_tokens(text: Optional[str], *, add_special_tokens: bool = False) -> int:
+def count_tokens(
+    text: Optional[str],
+    *,
+    tokenizer: Optional[Any] = None,
+    add_special_tokens: bool = False,
+) -> int:
     """Return tokenizer-accurate token counts (model-specific when available)."""
 
     if not text:
@@ -161,13 +206,19 @@ def count_tokens(text: Optional[str], *, add_special_tokens: bool = False) -> in
     except Exception:
         return len(re.findall(r"\S+", text))
 
-def run_generation(prompt: str, image: Optional[Image.Image], max_tokens: int, temperature: float):
+def run_generation(
+    bundle: ModelBundle,
+    prompt: str,
+    image: Optional[Image.Image],
+    max_tokens: int,
+    temperature: float,
+):
     """Run the heavy model call under a lock to keep MLX thread-safe."""
 
     with infer_lock:
         answer = generate(
-            model=model,
-            processor=processor,
+            model=bundle.model,
+            processor=bundle.processor,
             image=image,
             prompt=prompt,
             max_tokens=max_tokens,
@@ -218,9 +269,11 @@ def chat_completion():
 
         messages = req.get("messages", [])
         max_tokens = req.get("max_tokens", 16384)
-        model_name = req.get("model", "")
+        requested_model = (req.get("model") or "").strip()
         temperature = req.get("temperature", 0.5)
         response_format = req.get("response_format", {"type": "text"})
+
+        model_name, bundle = get_model_bundle(requested_model or None)
 
         system_prompt, user_content, image = parse_messages(messages)
         format_instructions = build_format_instructions(response_format)
@@ -231,13 +284,14 @@ def chat_completion():
         # image = preprocess_image(image)
 
         formatted_prompt = apply_chat_template(
-            processor, config, final_prompt, num_images=1 if image else 0
+            bundle.processor, bundle.config, final_prompt, num_images=1 if image else 0
         )
 
         t_pre1 = perf_counter()
         t_gen0 = perf_counter()
 
         raw_text = run_generation(
+            bundle=bundle,
             prompt=formatted_prompt,
             image=image,
             max_tokens=max_tokens,
@@ -251,8 +305,8 @@ def chat_completion():
             return jsonify(error_payload), 400
         assert content_out is not None  # narrow type for static analyzers
 
-        prompt_tokens = count_tokens(formatted_prompt)
-        completion_tokens = count_tokens(content_out)
+        prompt_tokens = count_tokens(formatted_prompt, tokenizer=bundle.tokenizer)
+        completion_tokens = count_tokens(content_out, tokenizer=bundle.tokenizer)
         total_tokens = prompt_tokens + completion_tokens
 
         t_total1 = perf_counter()
@@ -265,7 +319,8 @@ def chat_completion():
 
         # === ログ出力 ===
         request_meta = {
-            "model": model_name,
+            "model_requested": requested_model or None,
+            "model_used": model_name,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "response_format": response_format.get("type", "text"),
