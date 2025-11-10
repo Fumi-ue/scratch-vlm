@@ -34,7 +34,6 @@ app = Flask(__name__)
 infer_lock = threading.Lock()
 
 MODEL_PATH = "mlx-community/Qwen3-VL-30B-A3B-Instruct-bf16"
-RESIZE_CONFIG_PATH = Path("config/resize.yaml")
 
 # モデル読み込み（起動時に1回）
 # MODEL_PATH を切り替えれば他モデルにも対応可。
