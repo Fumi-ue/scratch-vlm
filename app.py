@@ -33,15 +33,44 @@ if importlib.util.find_spec("torch") is None:
 app = Flask(__name__)
 infer_lock = threading.Lock()
 
-MODEL_PATH = "mlx-community/Qwen3-VL-30B-A3B-Instruct-bf16"
+# 利用可能なモデル一覧（選択肢はこの3つ）
+SUPPORTED_MODELS = [
+    "mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit",
+    "mlx-community/Qwen3-VL-32B-Instruct-8bit",
+    "mlx-community/Qwen3-VL-32B-Instruct-bf16",
+]
 
-# モデル読み込み（起動時に1回）
-# MODEL_PATH を切り替えれば他モデルにも対応可。
-model, processor = load(MODEL_PATH)
-config = load_config(MODEL_PATH)
-tokenizer = getattr(processor, "tokenizer", None)
-if tokenizer is None:
-    print("[WARN] tokenizer missing from processor; token counts will be approximate.")
+# 既定のモデル（未指定・不正指定時に使用）
+DEFAULT_MODEL = "mlx-community/Qwen3-VL-32B-Instruct-bf16"
+
+# モデルキャッシュ: model_path -> {model, processor, config, tokenizer}
+_MODEL_CACHE: Dict[str, Dict[str, Any]] = {}
+_load_lock = threading.Lock()
+
+
+def ensure_loaded(model_path: str) -> Dict[str, Any]:
+    """Load and cache the requested model bundle if not present."""
+
+    if model_path not in SUPPORTED_MODELS:
+        model_path = DEFAULT_MODEL
+    if model_path in _MODEL_CACHE:
+        return _MODEL_CACHE[model_path]
+    with _load_lock:
+        if model_path in _MODEL_CACHE:  # double‑check after acquiring lock
+            return _MODEL_CACHE[model_path]
+        mdl, proc = load(model_path)
+        cfg = load_config(model_path)
+        tok = getattr(proc, "tokenizer", None)
+        bundle = {"model": mdl, "processor": proc, "config": cfg, "tokenizer": tok}
+        _MODEL_CACHE[model_path] = bundle
+        if tok is None:
+            print(f"[WARN] tokenizer missing for {model_path}; token counts approximate.")
+        else:
+            print(f"[INFO] loaded: {model_path}")
+        return bundle
+
+# 既定モデルをプリロード（初回推論のレイテンシ低減）
+ensure_loaded(DEFAULT_MODEL)
 
 
 def build_format_instructions(response_format: Dict[str, Any]) -> str:
@@ -129,20 +158,23 @@ def parse_messages(messages: List[Dict[str, Any]]) -> Tuple[str, str, Optional[I
     return system_prompt.strip(), user_content.strip(), image
 
 
-def count_tokens(text: Optional[str], *, add_special_tokens: bool = False) -> int:
+def count_tokens(
+    text: Optional[str], *, add_special_tokens: bool = False, tokenizer_override: Any = None
+) -> int:
     """Return tokenizer-accurate token counts (model-specific when available)."""
 
     if not text:
         return 0
 
-    if tokenizer is None:
+    tok = tokenizer_override
+    if tok is None:
         return len(re.findall(r"\S+", text))
 
     try:
-        if hasattr(tokenizer, "encode"):
-            token_ids = tokenizer.encode(text, add_special_tokens=add_special_tokens)
+        if hasattr(tok, "encode"):
+            token_ids = tok.encode(text, add_special_tokens=add_special_tokens)
         else:
-            encoded = tokenizer(
+            encoded = tok(
                 text,
                 add_special_tokens=add_special_tokens,
                 return_attention_mask=False,
@@ -160,7 +192,15 @@ def count_tokens(text: Optional[str], *, add_special_tokens: bool = False) -> in
     except Exception:
         return len(re.findall(r"\S+", text))
 
-def run_generation(prompt: str, image: Optional[Image.Image], max_tokens: int, temperature: float):
+def run_generation(
+    *,
+    model: Any,
+    processor: Any,
+    prompt: str,
+    image: Optional[Image.Image],
+    max_tokens: int,
+    temperature: float,
+):
     """Run the heavy model call under a lock to keep MLX thread-safe."""
 
     with infer_lock:
@@ -217,7 +257,10 @@ def chat_completion():
 
         messages = req.get("messages", [])
         max_tokens = req.get("max_tokens", 16384)
-        model_name = req.get("model", "")
+        requested_model = (req.get("model", "") or "").strip()
+        effective_model = (
+            requested_model if requested_model in SUPPORTED_MODELS else DEFAULT_MODEL
+        )
         temperature = req.get("temperature", 0.5)
         response_format = req.get("response_format", {"type": "text"})
 
@@ -229,14 +272,23 @@ def chat_completion():
         t_pre0 = perf_counter()
         # image = preprocess_image(image)
 
+        # モデル選択＆キャッシュから取得
+        bundle = ensure_loaded(effective_model)
+        sel_model = bundle["model"]
+        sel_processor = bundle["processor"]
+        sel_config = bundle["config"]
+        sel_tokenizer = bundle.get("tokenizer")
+
         formatted_prompt = apply_chat_template(
-            processor, config, final_prompt, num_images=1 if image else 0
+            sel_processor, sel_config, final_prompt, num_images=1 if image else 0
         )
 
         t_pre1 = perf_counter()
         t_gen0 = perf_counter()
 
         raw_text = run_generation(
+            model=sel_model,
+            processor=sel_processor,
             prompt=formatted_prompt,
             image=image,
             max_tokens=max_tokens,
@@ -250,8 +302,8 @@ def chat_completion():
             return jsonify(error_payload), 400
         assert content_out is not None  # narrow type for static analyzers
 
-        prompt_tokens = count_tokens(formatted_prompt)
-        completion_tokens = count_tokens(content_out)
+        prompt_tokens = count_tokens(formatted_prompt, tokenizer_override=sel_tokenizer)
+        completion_tokens = count_tokens(content_out, tokenizer_override=sel_tokenizer)
         total_tokens = prompt_tokens + completion_tokens
 
         t_total1 = perf_counter()
@@ -264,7 +316,7 @@ def chat_completion():
 
         # === ログ出力 ===
         request_meta = {
-            "model": model_name,
+            "model": effective_model,
             "max_tokens": max_tokens,
             "temperature": temperature,
             "response_format": response_format.get("type", "text"),
@@ -286,7 +338,7 @@ def chat_completion():
                 "id": "chatcmpl-001",
                 "object": "chat.completion",
                 "created": int(datetime.now().timestamp()),
-                "model": model_name,
+                "model": effective_model,
                 "choices": [
                     {
                         "index": 0,
