@@ -36,6 +36,9 @@ infer_lock = threading.Lock()
 # 利用可能なモデル一覧（選択肢はこの3つ）
 SUPPORTED_MODELS = [
     "mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit",
+    "mlx-community/Qwen3-VL-30B-A3B-Instruct-8bit",
+    "mlx-community/Qwen3-VL-30B-A3B-Instruct-bf16",
+    "mlx-community/Qwen3-VL-32B-Instruct-4bit",
     "mlx-community/Qwen3-VL-32B-Instruct-8bit",
     "mlx-community/Qwen3-VL-32B-Instruct-bf16",
 ]
@@ -130,12 +133,16 @@ def validate_with_schema(obj: Dict[str, Any], schema: Dict[str, Any]) -> Tuple[b
         return False, str(exc)
 
 
-def parse_messages(messages: List[Dict[str, Any]]) -> Tuple[str, str, Optional[Image.Image]]:
-    """Split incoming messages into system text, user text, and optional image."""
+def parse_messages(messages: List[Dict[str, Any]]) -> Tuple[str, str, List[Image.Image]]:
+    """Split incoming messages into system text, user text, and zero-or-more images.
+
+    - Aggregates all image parts (type=image_url) from user messages in order.
+    - Concatenates any text parts to user_content.
+    """
 
     system_prompt = ""
     user_content = ""
-    image = None
+    images: List[Image.Image] = []
 
     for message in messages:
         role = message.get("role")
@@ -151,11 +158,18 @@ def parse_messages(messages: List[Dict[str, Any]]) -> Tuple[str, str, Optional[I
                         user_content += part.get("text", "") + "\n"
                     elif part.get("type") == "image_url":
                         url = part.get("image_url", {}).get("url", "")
+                        if not url:
+                            continue
                         base64_data = url.split(",")[-1]
-                        image = Image.open(BytesIO(base64.b64decode(base64_data)))
+                        try:
+                            img = Image.open(BytesIO(base64.b64decode(base64_data)))
+                            images.append(img)
+                        except Exception:
+                            # Skip malformed images without failing the whole request
+                            continue
             else:
                 user_content += str(content or "")
-    return system_prompt.strip(), user_content.strip(), image
+    return system_prompt.strip(), user_content.strip(), images
 
 
 def count_tokens(
@@ -197,7 +211,7 @@ def run_generation(
     model: Any,
     processor: Any,
     prompt: str,
-    image: Optional[Image.Image],
+    images: Optional[List[Image.Image]],
     max_tokens: int,
     temperature: float,
 ):
@@ -207,7 +221,7 @@ def run_generation(
         answer = generate(
             model=model,
             processor=processor,
-            image=image,
+            image=(images if images else None),
             prompt=prompt,
             max_tokens=max_tokens,
             temperature=temperature,
@@ -264,7 +278,7 @@ def chat_completion():
         temperature = req.get("temperature", 0.5)
         response_format = req.get("response_format", {"type": "text"})
 
-        system_prompt, user_content, image = parse_messages(messages)
+        system_prompt, user_content, images = parse_messages(messages)
         format_instructions = build_format_instructions(response_format)
         effective_system = (system_prompt + "\n" + format_instructions).strip()
         final_prompt = f"{effective_system}\n{user_content}".strip()
@@ -280,7 +294,7 @@ def chat_completion():
         sel_tokenizer = bundle.get("tokenizer")
 
         formatted_prompt = apply_chat_template(
-            sel_processor, sel_config, final_prompt, num_images=1 if image else 0
+            sel_processor, sel_config, final_prompt, num_images=len(images)
         )
 
         t_pre1 = perf_counter()
@@ -290,7 +304,7 @@ def chat_completion():
             model=sel_model,
             processor=sel_processor,
             prompt=formatted_prompt,
-            image=image,
+            images=images,
             max_tokens=max_tokens,
             temperature=temperature,
         )
